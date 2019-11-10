@@ -1,0 +1,393 @@
+/*
+    Github: https://github.com/eeWill/te-thermo-twister
+
+    Dependencies:
+    https://github.com/eeWill/CzMotor
+    https://github.com/eeWill/CzTimer
+*/
+#include "Controllino.h"
+#include "CzMotor.h"
+#include "CzTimer.h"
+#include "CzStateController.h"
+
+// Motor pins
+#define CPMOTOR1_STEP CONTROLLINO_DO2
+#define CPMOTOR1_DIR CONTROLLINO_DO1
+#define CPMOTOR1_EN CONTROLLINO_DO0
+
+// Other pins
+#define GREEN_LED CONTROLLINO_DO5
+#define RED_LED CONTROLLINO_DO4
+
+// Gauge selector Switch
+#define GAUGE_SELECTOR_1 CONTROLLINO_AI0
+#define GAUGE_SELECTOR_2 CONTROLLINO_AI1
+
+// Twist Count selector Switch
+#define TWIST_SELECTOR_1 CONTROLLINO_AI2
+#define TWIST_SELECTOR_2 CONTROLLINO_AI3
+
+#define WIRE_VISION CONTROLLINO_AI5
+#define FOOT_PEDAL CONTROLLINO_AI7
+#define WIRE_CLAMP CONTROLLINO_DO3
+#define CALIBRATION_BUTTON CONTROLLINO_AI4
+#define TEACH_RELAY CONTROLLINO_R9
+
+#define CLAMP_DELAY_MILLIS 50
+#define POST_CLAMP_DELAY_MILLIS 10
+//Motor set to 1600 steps / rev
+
+#define ONE_TWIST_STEP_COUNT_20 960
+#define TWO_TWIST_STEP_COUNT_20
+#define THREE_TWIST_STEP_COUNT_20
+#define ONE_TWIST_STEP_COUNT_24 960
+#define TWO_TWIST_STEP_COUNT_24
+#define THREE_TWIST_STEP_COUNT_24
+#define ONE_TWIST_STEP_COUNT_28 1226
+#define TWO_TWIST_STEP_COUNT_28
+#define THREE_TWIST_STEP_COUNT_28
+
+#define LED_BLINK_DELAY_MILLIS 250
+
+// Sensor that determine if panel door is open or closed, inputs become disabled if open
+#define PANEL_SAFETY_SENSOR CONTROLLINO_AI6
+
+// How often we check if a panel is open
+#define OPEN_PANEL_CHECK_MILLIS 100
+
+// How long to delay after the wire is twisted and released
+#define POST_TWIST_DELAY_MILLIS 500
+
+#define PULSE_T1_MILLIS 750
+#define PULSE_T2_MILLIS 5000
+#define PULSE_T3_MILLIS 750
+
+// Modes
+#define DEACTIVATED 1001
+#define ALIGNING 1004
+#define WAITING 1002
+#define TWISTING 1003
+#define CABLE_REMOVAL 1005
+#define CALIBRATING 1006
+
+int gaugeSwitchValue = 0;
+int twistCountValue = 0;
+int PanelOpenedFlag = false;
+int motorInitialPosition = 0;
+bool motorAlignFoundHole = false;
+int motorAlignFoundHoleSteps = 0;
+bool motorAlignPassedHole = false;
+int motorAlignPassedHoleSteps = 0;
+int motorStepCountForTwist = 0;
+int Reverse = LOW;
+int TwistDirection = HIGH;
+
+CzTimer checkPanelSafetyTimer = CzTimer();
+CzTimer ledBlinkTimer = CzTimer();
+CzTimer teachPhaseTimer = CzTimer();
+
+CzMotor motor = CzMotor(CPMOTOR1_STEP, CPMOTOR1_DIR, CPMOTOR1_EN);
+
+CzStateController controller = CzStateController();
+
+void setup()
+{
+  pinMode(CPMOTOR1_DIR, OUTPUT);
+  pinMode(CPMOTOR1_STEP, OUTPUT);
+  pinMode(CPMOTOR1_EN, OUTPUT);
+
+  pinMode(GAUGE_SELECTOR_1, INPUT);
+  pinMode(GAUGE_SELECTOR_2, INPUT);
+
+  pinMode(TWIST_SELECTOR_1, INPUT);
+  pinMode(TWIST_SELECTOR_2, INPUT);
+
+  pinMode(WIRE_VISION, INPUT);
+  pinMode(FOOT_PEDAL, INPUT);
+  pinMode(WIRE_CLAMP, OUTPUT);
+  pinMode(CALIBRATION_BUTTON, INPUT);
+
+  digitalWrite(CPMOTOR1_EN, HIGH);
+  digitalWrite(CPMOTOR1_DIR, HIGH);
+
+  int gaugeSwitchValue = readSelectorSwitch(GAUGE_SELECTOR_1, GAUGE_SELECTOR_2);
+  controller.setWireGauge(gaugeSwitchValue);
+
+  int twistCountValue = readSelectorSwitch(TWIST_SELECTOR_1, TWIST_SELECTOR_2);
+  controller.setTwistCount(twistCountValue);
+
+  checkPanelSafetyTimer.start();
+  checkPanelSafetyTimer.setDelay(OPEN_PANEL_CHECK_MILLIS);
+
+  ledBlinkTimer.start();
+  ledBlinkTimer.setDelay(LED_BLINK_DELAY_MILLIS);
+
+  teachPhaseTimer.start();
+  teachPhaseTimer.setDelay(PULSE_T2_MILLIS);
+
+  motor.setDirection(TwistDirection);
+  delay(1000);
+  if (digitalRead(CONTROLLINO_AI5) == HIGH ) {
+    delay(1000);
+    motor.setStepDelayMicros(120);
+    delay(5);
+    motor.takeSteps(600);
+  }
+  controller.setMode(ALIGNING);
+  Serial.begin(9600);
+}
+
+void loop()
+{
+  int gaugeSwitchValue = readSelectorSwitch(GAUGE_SELECTOR_1, GAUGE_SELECTOR_2);
+  //Serial.println(gaugeSwitchValue);
+  controller.setWireGauge(gaugeSwitchValue);
+
+  int twistCountValue = readSelectorSwitch(TWIST_SELECTOR_1, TWIST_SELECTOR_2);
+  //Serial.println(twistCountValue);
+  controller.setTwistCount(twistCountValue);
+
+  int calibrationButtonValue = digitalRead(CALIBRATION_BUTTON);
+  int wireVisionValue = digitalRead(WIRE_VISION);
+  int FOOT_PEDAL_STATUS = digitalRead(FOOT_PEDAL);
+
+  if (calibrationButtonValue == HIGH) {
+    controller.setMode(CALIBRATING);
+  }
+
+  // Disable motor and return from loop if the panel door is open.
+  if (checkPanelSafetyTimer.delayHasPassed()) {
+    int panelSensor = digitalRead(PANEL_SAFETY_SENSOR);
+
+    if (panelSensor == LOW) {
+      if (panelSensor == LOW && digitalRead(CONTROLLINO_AI5) == HIGH) {
+        PanelOpenedFlag = true;
+      }
+      activateLight(RED_LED);
+      Serial.println("PanelSensor");
+      controller.setMode(DEACTIVATED);
+      //motor.disable();  //THIS IS NOW HARD WIRED IN
+    }
+
+    if (controller.getMode() == DEACTIVATED && panelSensor == HIGH) {
+      controller.setMode(ALIGNING);
+      //motor.enable();
+      return;
+    }
+    checkPanelSafetyTimer.reset();
+  }
+
+  /*
+     Motor rotates blindly until laser vision aligns with hole, it takes the average of when the hole was
+       first found and when the hole is passed, then reverses to the distance between them. Once the hole is
+       found the system is set to WAITING mode.
+  */
+  if (controller.getMode() == ALIGNING) {
+    motor.setStepDelayMicros(10000);
+    activateLight(RED_LED);
+    //Serial.println("Aligning");
+    motor.takeStep();
+    if (wireVisionValue == HIGH && PanelOpenedFlag == true ) {
+      motor.setStepDelayMicros(50);
+      motor.takeSteps(600);
+      PanelOpenedFlag = false;
+      return;
+    }
+    if (wireVisionValue == HIGH && motorAlignFoundHole == false ) {
+      motor.setStepDelayMicros(20000);
+      motorAlignFoundHole = true;
+      motorAlignFoundHoleSteps = motor.getCurrentSteps();
+      Serial.println("FoundHole");
+
+    }
+
+    if (motorAlignFoundHole && wireVisionValue == LOW) {
+      motorAlignPassedHole = true;
+      motorAlignPassedHoleSteps = motor.getCurrentSteps();
+      //motorAlignFoundHole = false;
+      //motorAlignPassedHole = false;
+      //controller.setMode(WAITING);
+      //delay(100);
+      //return;
+    }
+
+    if (motorAlignFoundHole && motorAlignPassedHole) {
+      motor.setDirection(Reverse);
+      delay(5); //Give motor controller time to swtich direction
+      unsigned long CenteringSteps = (motorAlignPassedHoleSteps - motorAlignFoundHoleSteps) / 2;
+      motor.takeSteps(CenteringSteps);
+      Serial.println("CenteringHole");
+      Serial.println(motorAlignPassedHoleSteps);
+      Serial.println(motorAlignFoundHoleSteps);
+      Serial.println(CenteringSteps);
+      motor.setDirection(TwistDirection);  //Does this switch between the two directions or is this direction written wrong?
+      Serial.println("CenteringHole");
+      motorAlignFoundHole = false;
+      motorAlignPassedHole = false;
+      controller.setMode(WAITING);
+      delay(100);
+      return;
+    }
+  }
+  /*
+     The machine waits for the operator to enter a wire. Once the wire is seen by the laser, the machine
+       enters TWISTING mode.
+  */
+  if (controller.getMode() == WAITING) {
+    activateLight(GREEN_LED);
+    //Serial.println("Waiting");
+    int wireVisionValue = digitalRead(WIRE_VISION);
+    //Serial.println(wireVisionValue);
+
+    if (wireVisionValue == LOW || FOOT_PEDAL_STATUS == HIGH) {
+      Serial.println(wireVisionValue);
+      controller.setMode(TWISTING);
+    }
+
+  }
+
+  /*
+     After a short delay, the clamp comes down, and the motor twists the calculated number of steps based on
+       the wire gauge selector and twist count selector. The clamp is released, and we enter CABLE_REMOVAL mode
+  */
+  if (controller.getMode() == TWISTING) {
+    motor.setStepDelayMicros(30);
+    Serial.println("Twisting");
+    activateLight(RED_LED);
+    delay(CLAMP_DELAY_MILLIS);
+    digitalWrite(WIRE_CLAMP, HIGH);
+    delay(POST_CLAMP_DELAY_MILLIS);
+
+    motorStepCountForTwist = getMotorStepCountForTwist();
+    motor.takeSteps(motorStepCountForTwist);
+
+    digitalWrite(WIRE_CLAMP, LOW);
+    Serial.println("CableRemoval");
+    activateLight(GREEN_LED);
+    // controller.setMode(ALIGNING);
+    controller.setMode(CABLE_REMOVAL);
+    delay(POST_TWIST_DELAY_MILLIS);
+    return;
+
+  }
+  //After twisting and cable removal - motor is definitely drifting.  Probably a small problem with counting.
+  /*
+     A short delay gives the operator time to remove the cable.
+  */
+  if (controller.getMode() == CABLE_REMOVAL) {
+    Serial.println("CableRemoval");
+    delay(POST_TWIST_DELAY_MILLIS);
+    motor.reverseDirection();
+    delay(5); // This gives the motor time to switch direction, otherwise the step counts get lost.
+    motor.takeSteps(motorStepCountForTwist);
+    delay(5);
+    motor.reverseDirection();
+    controller.setMode(WAITING);
+    delay(100);
+    activateLight(GREEN_LED);
+    return;
+  }
+
+  /*
+    When the operator holds down the calibration button, the Teach 2 calibration steps begin
+    https://cdn.automationdirect.com/static/manuals/dft_teach/DFT-AN-1A.pdf
+  */
+  if (controller.getMode() == CALIBRATING) {
+    //motor.disable();
+    Serial.println("Calibrating");
+    activateLight(RED_LED);
+    digitalWrite(TEACH_RELAY, HIGH);
+    delay(PULSE_T1_MILLIS);
+    digitalWrite(TEACH_RELAY, LOW);
+
+    teachPhaseTimer.reset();
+    while (!teachPhaseTimer.delayHasPassed()) {
+      blink(RED_LED);
+    }
+
+    digitalWrite(TEACH_RELAY, HIGH);
+    delay(PULSE_T3_MILLIS);
+    digitalWrite(TEACH_RELAY, LOW);
+
+    bool wireInMachine = true;
+
+    while (wireInMachine) {
+      Serial.println("WireInMachine");
+      int wireVision = digitalRead(WIRE_VISION);
+
+      blink(GREEN_LED);
+
+      if (wireVision == LOW) {
+        wireInMachine = false;
+      }
+    }
+
+    motor.enable();
+    controller.setMode(ALIGNING);
+  }
+
+}
+
+void activateLight(int LED_PIN) {
+  if (LED_PIN == GREEN_LED) {
+    digitalWrite(GREEN_LED, HIGH);
+    digitalWrite(RED_LED, LOW);
+  } else if (LED_PIN == RED_LED) {
+    digitalWrite(RED_LED, HIGH);
+    digitalWrite(GREEN_LED, LOW);
+  } else {
+    digitalWrite(GREEN_LED, HIGH);
+    digitalWrite(RED_LED, HIGH);
+  }
+}
+
+void invertLedValue(int LED_PIN) {
+  int ledValue = digitalRead(LED_PIN);
+
+  if (ledValue == HIGH) {
+    digitalWrite(LED_PIN, LOW);
+  } else {
+    digitalWrite(LED_PIN, HIGH);
+  }
+}
+
+void blink(int LED_PIN) {
+  if (ledBlinkTimer.delayHasPassed()) {
+    invertLedValue(LED_PIN);
+    ledBlinkTimer.reset();
+  }
+}
+
+int readSelectorSwitch(int pinOne, int pinTwo) {
+  int pinOneValue = digitalRead(pinOne);
+  int pinTwoValue = digitalRead(pinTwo);
+
+  if (pinOneValue == LOW && pinTwoValue == HIGH) {
+    return 3;
+  } else if (pinOneValue == LOW && pinTwoValue == LOW) {
+    return 2;
+  } else if (pinOneValue == HIGH && pinTwoValue == LOW) {
+    return 1;
+  } else {
+    return 0;
+  }
+}
+
+int getMotorStepCountForTwist() {
+  int wireGauge = controller.getWireGauge();
+  int twistCount = controller.getTwistCount();
+
+  if (wireGauge == 1) {
+    return ONE_TWIST_STEP_COUNT_20 * twistCount;
+  }
+
+  if (wireGauge == 2) {
+    return ONE_TWIST_STEP_COUNT_24 * twistCount;
+  }
+
+  if (wireGauge == 3) {
+    return ONE_TWIST_STEP_COUNT_28 * twistCount;
+  }
+
+  return 0;
+}

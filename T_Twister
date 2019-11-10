@@ -10,7 +10,7 @@
 #include "CzTimer.h"
 #include "CzStateController.h"
 
-// Motor pins
+// Motor pinsf
 #define CPMOTOR1_STEP CONTROLLINO_DO2
 #define CPMOTOR1_DIR CONTROLLINO_DO1
 #define CPMOTOR1_EN CONTROLLINO_DO0
